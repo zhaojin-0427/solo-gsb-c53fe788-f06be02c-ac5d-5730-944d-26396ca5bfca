@@ -1,0 +1,10 @@
+services:
+  oven:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/oven.db
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
