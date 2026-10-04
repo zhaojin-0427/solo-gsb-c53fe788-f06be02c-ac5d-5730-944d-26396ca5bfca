@@ -152,6 +152,20 @@ tbody tr.initial { color: var(--muted); background: #f9fbfd; }
 .pill.good { color: var(--ok); border-color: #b8dfc5; background: var(--soft-ok); }
 .pill.bad { color: var(--bad); border-color: #efb6b6; background: var(--soft-bad); }
 
+.diagnosis-panel { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 14px; }
+.diagnosis-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.diagnosis-header h3 { margin: 0; }
+.diagnosis-panel h4 { margin: 16px 0 8px; font-size: 14px; color: #314458; }
+.diagnosis-meta { color: var(--muted); font-size: 13px; }
+.core-list { margin: 0; padding-left: 22px; }
+.core-list li { margin-bottom: 6px; }
+.core-list .muted { margin-left: 8px; }
+.witness-card { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 8px 0; background: #fbfdff; }
+.witness-title { font-weight: 700; margin-bottom: 6px; }
+.witness-curve { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.chip { border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #fff; }
+tr.core-row td { background: var(--soft-bad); }
+
 .toast {
   position: fixed;
   right: 18px;

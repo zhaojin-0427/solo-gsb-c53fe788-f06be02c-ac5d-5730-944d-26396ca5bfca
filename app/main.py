@@ -31,6 +31,7 @@ from z3 import (
 getcontext().prec = 100
 
 SOLVE_TIMEOUT_MS = 10_000
+DIAGNOSE_TIMEOUT_MS = 10_000
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 DATABASE_PATH = Path(
@@ -142,6 +143,17 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS diagnoses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                elapsed_ms INTEGER NOT NULL,
+                result_json TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -176,6 +188,52 @@ def get_snapshot(snapshot_id: int) -> Optional[Dict[str, Any]]:
             (snapshot_id,),
         ).fetchone()
     return json.loads(row[0]) if row else None
+
+
+def get_snapshot_row(snapshot_id: int) -> Optional[Tuple[str, str]]:
+    """Return (status, request_json) for a snapshot, or None if it does not exist."""
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            "SELECT status, request_json FROM snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def save_diagnosis(snapshot_id: int, result: Dict[str, Any]) -> Tuple[int, str]:
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    result_json = json.dumps(result, ensure_ascii=False)
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO diagnoses (snapshot_id, created_at, elapsed_ms, result_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (snapshot_id, created_at, result["elapsed_ms"], result_json),
+        )
+        conn.commit()
+        return int(cursor.lastrowid), created_at
+
+
+def get_latest_diagnosis(snapshot_id: int) -> Optional[Dict[str, Any]]:
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT id, created_at, result_json FROM diagnoses
+            WHERE snapshot_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (snapshot_id,),
+        ).fetchone()
+    if not row:
+        return None
+    diagnosis_id, created_at, result_json = row
+    result = json.loads(result_json)
+    result["diagnosis_id"] = diagnosis_id
+    result["snapshot_id"] = snapshot_id
+    result["created_at"] = created_at
+    return result
 
 
 def list_snapshots() -> List[Dict[str, Any]]:
@@ -452,6 +510,395 @@ def check_candidate(
     return "unknown", candidate, reason
 
 
+def build_diagnosis_model(
+    request: SolveRequest,
+) -> Tuple[List[Any], Dict[str, List[Any]], List[Dict[str, Any]]]:
+    """Rebuild the exact Z3 model, split into always-on assertions and toggleable groups.
+
+    Always-on (never removed): setpoint integrality (Int variables), the temperature
+    recurrence, temperature non-negativity, and the positive-part definition of the
+    heat exposure increments.  Toggleable groups, in deletion-pass order:
+
+    1. the 0~300 range of all setpoints (one group);
+    2. all adjacent-minute ramp limits (one group);
+    3. each locked minute, in increasing minute order (one group per lock);
+    4. per zone in input order: the full-trajectory upper bound of all its
+       trajectories, the final-temperature interval, and the minimum heat exposure
+       (one group each).
+
+    The model is returned in two logically equivalent encodings of the positive
+    part max(0, T-threshold): ``boolean`` is the piecewise-linear If/Boolean
+    encoding used by make_solver, ``functional`` folds the same definition into
+    the exposure sum as If-expressions.  Both define exactly the same constraint
+    system; the diagnosis solver portfolio may use either, and every witness is
+    additionally re-verified with exact Python rational arithmetic.
+    """
+    setpoint_vars = [Int(f"u_{minute}") for minute in range(1, request.duration + 1)]
+    base_boolean: List[Any] = []
+    base_functional: List[Any] = []
+    groups: List[Dict[str, Any]] = []
+
+    range_assertions: List[Any] = []
+    for value in setpoint_vars:
+        range_assertions.extend([value >= 0, value <= 300])
+    groups.append(
+        {
+            "id": "setpoint_range",
+            "kind": "setpoint_range",
+            "name": "设定值 0～300℃ 范围",
+            "assertions": range_assertions,
+            "assertions_alt": range_assertions,
+            "detail": {"minutes": list(range(1, request.duration + 1))},
+        }
+    )
+
+    ramp_assertions: List[Any] = []
+    for previous, current in zip(setpoint_vars, setpoint_vars[1:]):
+        ramp_assertions.extend(
+            [
+                current - previous <= request.max_setpoint_change,
+                previous - current <= request.max_setpoint_change,
+            ]
+        )
+    groups.append(
+        {
+            "id": "ramp_limit",
+            "kind": "ramp_limit",
+            "name": f"相邻分钟跃变 ≤ {request.max_setpoint_change}℃",
+            "assertions": ramp_assertions,
+            "assertions_alt": ramp_assertions,
+            "detail": {
+                "max_change": request.max_setpoint_change,
+                "pairs": [[minute, minute + 1] for minute in range(1, request.duration)],
+            },
+        }
+    )
+
+    for minute in sorted(request.locked_minutes):
+        locked_value = request.locked_minutes[minute]
+        lock_assertions = [setpoint_vars[minute - 1] == locked_value]
+        groups.append(
+            {
+                "id": f"lock_{minute}",
+                "kind": "lock",
+                "name": f"锁定第 {minute} 分钟 = {locked_value}℃",
+                "assertions": lock_assertions,
+                "assertions_alt": lock_assertions,
+                "detail": {"minute": minute, "value": locked_value},
+            }
+        )
+
+    for zone_index, zone in enumerate(request.zones, start=1):
+        initial = decimal_to_fraction(Decimal(zone.initial_temperature))
+        upper = decimal_to_fraction(zone.max_temperature)
+        low = decimal_to_fraction(zone.final_low)
+        high = decimal_to_fraction(zone.final_high)
+        threshold = decimal_to_fraction(zone.exposure_threshold)
+        required = decimal_to_fraction(zone.min_exposure)
+        upper_z3 = fraction_to_z3(upper)
+        threshold_z3 = fraction_to_z3(threshold)
+
+        upper_assertions: List[Any] = []
+        final_assertions: List[Any] = []
+        exposure_assertions: List[Any] = []
+        exposure_assertions_alt: List[Any] = []
+
+        for trajectory_index, coefficient in enumerate(zone.coefficients):
+            alpha = fraction_to_z3(decimal_to_fraction(coefficient))
+            temperature = fraction_to_z3(initial)
+            upper_assertions.append(temperature <= upper_z3)
+            exposure = RealVal(0)
+            exposure_alt = RealVal(0)
+
+            for minute, setpoint in enumerate(setpoint_vars, start=1):
+                temperature = temperature + alpha * (setpoint - temperature)
+                base_boolean.append(temperature >= 0)
+                base_functional.append(temperature >= 0)
+                upper_assertions.append(temperature <= upper_z3)
+
+                above_threshold = temperature - threshold_z3
+                # Same piecewise-linear encoding of max(0, T-threshold) as make_solver.
+                excess = Real(f"excess_z{zone_index}_a{trajectory_index}_t{minute}")
+                positive_branch = Bool(f"positive_z{zone_index}_a{trajectory_index}_t{minute}")
+                base_boolean.append(
+                    If(
+                        positive_branch,
+                        And(excess == above_threshold, excess >= 0, above_threshold >= 0),
+                        And(excess == 0, above_threshold <= 0),
+                    )
+                )
+                exposure = exposure + excess
+                # Equivalent functional encoding of the same positive part.
+                exposure_alt = exposure_alt + If(above_threshold >= 0, above_threshold, 0)
+
+            final_assertions.extend(
+                [temperature >= fraction_to_z3(low), temperature <= fraction_to_z3(high)]
+            )
+            exposure_assertions.append(exposure >= fraction_to_z3(required))
+            exposure_assertions_alt.append(exposure_alt >= fraction_to_z3(required))
+
+        coefficients = [str(coefficient) for coefficient in zone.coefficients]
+        groups.append(
+            {
+                "id": f"zone_{zone_index}_upper",
+                "kind": "zone_upper",
+                "name": f"{zone.name}：全程温度 ≤ {zone.max_temperature}℃",
+                "assertions": upper_assertions,
+                "assertions_alt": upper_assertions,
+                "detail": {
+                    "zone_index": zone_index,
+                    "zone_name": zone.name,
+                    "coefficients": coefficients,
+                    "minutes": list(range(0, request.duration + 1)),
+                    "bound": str(zone.max_temperature),
+                },
+            }
+        )
+        groups.append(
+            {
+                "id": f"zone_{zone_index}_final",
+                "kind": "zone_final",
+                "name": f"{zone.name}：终温 ∈ [{zone.final_low}, {zone.final_high}]℃",
+                "assertions": final_assertions,
+                "assertions_alt": final_assertions,
+                "detail": {
+                    "zone_index": zone_index,
+                    "zone_name": zone.name,
+                    "coefficients": coefficients,
+                    "minute": request.duration,
+                    "low": str(zone.final_low),
+                    "high": str(zone.final_high),
+                },
+            }
+        )
+        groups.append(
+            {
+                "id": f"zone_{zone_index}_exposure",
+                "kind": "zone_exposure",
+                "name": f"{zone.name}：累计热暴露 ≥ {zone.min_exposure}",
+                "assertions": exposure_assertions,
+                "assertions_alt": exposure_assertions_alt,
+                "detail": {
+                    "zone_index": zone_index,
+                    "zone_name": zone.name,
+                    "coefficients": coefficients,
+                    "minutes": list(range(1, request.duration + 1)),
+                    "threshold": str(zone.exposure_threshold),
+                    "required": str(zone.min_exposure),
+                },
+            }
+        )
+
+    return setpoint_vars, {"boolean": base_boolean, "functional": base_functional}, groups
+
+
+# Solver portfolio tried in order for every group-subset check.  All entries solve
+# the same exact constraint system (the two encodings are logically equivalent), so
+# any decisive verdict is valid; the per-attempt budget caps keep one pathological
+# query from exhausting the shared 10 second diagnosis budget.
+CHECK_PORTFOLIO = (
+    ("boolean", {}, 0.3, 2.0),
+    ("functional", {}, 0.4, 3.0),
+    ("boolean", {"auto_config": False, "smt.case_split": 3}, 1.0, None),
+)
+
+
+def check_group_subset(
+    base: Dict[str, List[Any]],
+    groups: List[Dict[str, Any]],
+    setpoint_vars: List[Any],
+    active_ids: List[str],
+    deadline: float,
+) -> CheckOutcome:
+    """Check always-on assertions plus the selected groups under the shared deadline."""
+    active = set(active_ids)
+    last_reason = "timeout"
+    for encoding, config, fraction, cap_seconds in CHECK_PORTFOLIO:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            break
+        budget = remaining * fraction
+        if cap_seconds is not None:
+            budget = min(budget, cap_seconds)
+        solver = Solver()
+        for key, value in config.items():
+            solver.set(key, value)
+        solver.add(*base[encoding])
+        for group in groups:
+            if group["id"] in active:
+                if encoding == "boolean":
+                    solver.add(*group["assertions"])
+                else:
+                    solver.add(*group["assertions_alt"])
+        solver.set("timeout", max(1, int(budget * 1000)))
+        result = solver.check()
+        if result == sat:
+            model = solver.model()
+            values = [
+                model.eval(value, model_completion=True).as_long() for value in setpoint_vars
+            ]
+            return "sat", values, ""
+        if result == unsat:
+            return "unsat", None, str(solver.reason_unknown())
+        last_reason = str(solver.reason_unknown())
+    return "unknown", None, last_reason
+
+
+def verify_subset(
+    request: SolveRequest,
+    setpoints: List[int],
+    active_ids: set,
+) -> bool:
+    """Independently verify a witness with exact rational arithmetic.
+
+    Checks the always-on constraints (recurrence and non-negativity hold by
+    construction of the replayed trajectories) plus every active toggleable group.
+    """
+    if len(setpoints) != request.duration:
+        return False
+    if "setpoint_range" in active_ids:
+        if any(not 0 <= value <= 300 for value in setpoints):
+            return False
+    if "ramp_limit" in active_ids:
+        if any(
+            abs(a - b) > request.max_setpoint_change
+            for a, b in zip(setpoints, setpoints[1:])
+        ):
+            return False
+    for minute, locked_value in request.locked_minutes.items():
+        if f"lock_{minute}" in active_ids and setpoints[minute - 1] != locked_value:
+            return False
+
+    for zone_index, zone in enumerate(request.zones, start=1):
+        upper = decimal_to_fraction(zone.max_temperature)
+        low = decimal_to_fraction(zone.final_low)
+        high = decimal_to_fraction(zone.final_high)
+        threshold = decimal_to_fraction(zone.exposure_threshold)
+        required = decimal_to_fraction(zone.min_exposure)
+
+        for coefficient in zone.coefficients:
+            alpha = decimal_to_fraction(coefficient)
+            temperatures = [Fraction(zone.initial_temperature)]
+            for setpoint in setpoints:
+                previous = temperatures[-1]
+                temperatures.append(previous + alpha * (Fraction(setpoint) - previous))
+
+            if any(value < 0 for value in temperatures[1:]):
+                return False
+            if f"zone_{zone_index}_upper" in active_ids:
+                if any(value > upper for value in temperatures):
+                    return False
+            if f"zone_{zone_index}_final" in active_ids:
+                if not low <= temperatures[-1] <= high:
+                    return False
+            if f"zone_{zone_index}_exposure" in active_ids:
+                exposure = sum(
+                    max(Fraction(0), value - threshold) for value in temperatures[1:]
+                )
+                if exposure < required:
+                    return False
+    return True
+
+
+def diagnose(request: SolveRequest) -> Dict[str, Any]:
+    """Find a deletion-minimal infeasible group subset for a proven-unsat input.
+
+    All Z3 re-runs share one 10 second budget.  The result is only returned when
+    the final subset is proven infeasible and every single-group deletion from
+    that final subset is proven feasible with an independently verified witness;
+    otherwise an undecided outcome is returned and nothing is saved.
+    """
+    started = time.perf_counter()
+    deadline = started + (DIAGNOSE_TIMEOUT_MS - 200) / 1000
+    setpoint_vars, base, groups = build_diagnosis_model(request)
+    checks = 0
+
+    def run(active_ids: List[str]) -> CheckOutcome:
+        nonlocal checks
+        checks += 1
+        return check_group_subset(base, groups, setpoint_vars, active_ids, deadline)
+
+    def undecided(reason: Optional[str] = None) -> Dict[str, Any]:
+        outcome: Dict[str, Any] = {
+            "status": "undecided",
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            "checks": checks,
+        }
+        if reason:
+            outcome["solver_reason"] = reason
+        return outcome
+
+    all_ids = [group["id"] for group in groups]
+    status, _, reason = run(all_ids)
+    if status == "sat":
+        return {
+            "status": "rerun_sat",
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            "checks": checks,
+        }
+    if status != "unsat":
+        return undecided(reason)
+
+    # Deletion pass over the full set, in group order: a group is dropped only
+    # when the remaining groups are still proven infeasible.
+    core = list(all_ids)
+    for group in groups:
+        group_id = group["id"]
+        if group_id not in core:
+            continue
+        trial = [item for item in core if item != group_id]
+        trial_status, _, _ = run(trial)
+        if trial_status == "unsat":
+            core = trial
+
+    # Feasibility witnesses: delete each remaining group from the FINAL subset
+    # (never reuse results obtained by deleting groups from the full set).
+    group_by_id = {group["id"]: group for group in groups}
+    witnesses: List[Dict[str, Any]] = []
+    for group_id in core:
+        trial = [item for item in core if item != group_id]
+        witness_status, values, witness_reason = run(trial)
+        if witness_status != "sat" or values is None:
+            return undecided(witness_reason)
+        if not verify_subset(request, values, set(trial)):
+            return {"status": "witness_failed", "elapsed_ms": int((time.perf_counter() - started) * 1000)}
+        witnesses.append(
+            {
+                "group_id": group_id,
+                "group_name": group_by_id[group_id]["name"],
+                "setpoints": values,
+                "objective_total": sum(values),
+            }
+        )
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    group_payloads = [
+        {
+            "id": group["id"],
+            "kind": group["kind"],
+            "name": group["name"],
+            "detail": group["detail"],
+            "constraint_count": len(group["assertions"]),
+            "in_core": group["id"] in core,
+        }
+        for group in groups
+    ]
+    return {
+        "status": "diagnosed",
+        "status_text": "诊断完成",
+        "message": (
+            f"在 {len(groups)} 个可开关约束组中定位到 {len(core)} 组极小冲突："
+            "该子集仍无解，且删除其中任意一组即可恢复可行。"
+        ),
+        "elapsed_ms": elapsed_ms,
+        "timeout_ms": DIAGNOSE_TIMEOUT_MS,
+        "checks": checks,
+        "groups": group_payloads,
+        "core": core,
+        "witnesses": witnesses,
+    }
+
+
 def feasible_payload(
     request: SolveRequest,
     setpoints: List[int],
@@ -655,6 +1102,58 @@ def snapshot_detail(snapshot_id: int) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="快照不存在")
     result["snapshot_id"] = snapshot_id
     return result
+
+
+@app.post("/api/snapshots/{snapshot_id}/diagnose")
+def diagnose_snapshot(snapshot_id: int) -> Dict[str, Any]:
+    row = get_snapshot_row(snapshot_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="快照不存在")
+    status, request_json = row
+    if status != "no_solution":
+        raise HTTPException(
+            status_code=409,
+            detail="仅“约束无解”快照支持诊断：该快照未证明无解",
+        )
+    if not request_json:
+        raise HTTPException(status_code=422, detail="快照缺少输入数据，无法还原诊断")
+    try:
+        request = SolveRequest(**json.loads(request_json))
+    except Exception:
+        raise HTTPException(status_code=422, detail="快照输入数据无法还原，诊断中止")
+
+    outcome = diagnose(request)
+    if outcome["status"] == "rerun_sat":
+        raise HTTPException(
+            status_code=409,
+            detail="按原模型重跑后约束有解，与快照的无解结论不一致，未保存诊断",
+        )
+    if outcome["status"] == "witness_failed":
+        raise HTTPException(
+            status_code=500,
+            detail="可行性见证未通过独立精确校验，未保存诊断",
+        )
+    if outcome["status"] != "diagnosed":
+        raise HTTPException(
+            status_code=504,
+            detail="诊断在 10 秒共享预算内未决或超时，未保存部分诊断",
+        )
+
+    diagnosis_id, created_at = save_diagnosis(snapshot_id, outcome)
+    outcome["diagnosis_id"] = diagnosis_id
+    outcome["snapshot_id"] = snapshot_id
+    outcome["created_at"] = created_at
+    return outcome
+
+
+@app.get("/api/snapshots/{snapshot_id}/diagnosis")
+def snapshot_diagnosis(snapshot_id: int) -> Dict[str, Any]:
+    if get_snapshot_row(snapshot_id) is None:
+        raise HTTPException(status_code=404, detail="快照不存在")
+    diagnosis = get_latest_diagnosis(snapshot_id)
+    if diagnosis is None:
+        raise HTTPException(status_code=404, detail="该快照尚未保存诊断")
+    return diagnosis
 
 
 @app.get("/", include_in_schema=False)

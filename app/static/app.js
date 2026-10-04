@@ -27,6 +27,7 @@ const defaults = {
 };
 
 const els = {};
+let currentSnapshotId = null;
 
 function onReady() {
   els.duration = document.getElementById("duration");
@@ -42,9 +43,14 @@ function onReady() {
   els.resultBody = document.getElementById("resultBody");
   els.snapshotList = document.getElementById("snapshotList");
   els.toast = document.getElementById("toast");
+  els.diagnosisPanel = document.getElementById("diagnosisPanel");
+  els.diagnoseBtn = document.getElementById("diagnoseBtn");
+  els.diagnosisHint = document.getElementById("diagnosisHint");
+  els.diagnosisBody = document.getElementById("diagnosisBody");
 
   els.duration.addEventListener("change", renderLockInputs);
   els.solveBtn.addEventListener("click", solve);
+  els.diagnoseBtn.addEventListener("click", runDiagnosis);
   els.resetBtn.addEventListener("click", () => {
     fillForm(defaults);
     showToast("已恢复示例参数");
@@ -174,6 +180,9 @@ function renderResult(result) {
   els.resultMessage.textContent = result.message;
   els.solveMeta.innerHTML = `求解耗时 ${result.elapsed_ms} ms / 限时 ${result.timeout_ms} ms<br>快照编号 #${result.snapshot_id}`;
 
+  currentSnapshotId = result.snapshot_id ?? null;
+  updateDiagnosisPanel(result);
+
   if (!result.setpoints || result.setpoints.length === 0) {
     els.resultBody.innerHTML = "";
     els.resultPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -231,6 +240,118 @@ function renderTrajectory(trajectory) {
       </table>
     </div>
   `;
+}
+
+function updateDiagnosisPanel(result) {
+  if (result.status === "no_solution" && result.snapshot_id) {
+    els.diagnosisPanel.hidden = false;
+    els.diagnosisBody.innerHTML = "";
+    els.diagnosisHint.hidden = false;
+    els.diagnosisHint.textContent =
+      "该快照已证明无解。可运行诊断：按原精确模型从快照输入还原约束，在共享 10 秒预算内找出极小冲突约束组。";
+    els.diagnoseBtn.textContent = "运行诊断";
+    loadSavedDiagnosis(result.snapshot_id);
+  } else {
+    els.diagnosisPanel.hidden = true;
+    els.diagnosisBody.innerHTML = "";
+  }
+}
+
+async function loadSavedDiagnosis(snapshotId) {
+  try {
+    const response = await fetch(`/api/snapshots/${snapshotId}/diagnosis`);
+    if (!response.ok) return;
+    const data = await response.json();
+    if (currentSnapshotId !== snapshotId) return;
+    renderDiagnosis(data, true);
+  } catch (error) {
+    // 没有已保存的诊断时保持提示状态。
+  }
+}
+
+async function runDiagnosis() {
+  if (!currentSnapshotId) return;
+  const snapshotId = currentSnapshotId;
+  els.diagnoseBtn.disabled = true;
+  els.diagnoseBtn.textContent = "诊断中（最多 10 秒）";
+  try {
+    const response = await fetch(`/api/snapshots/${snapshotId}/diagnose`, { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) {
+      showToast(typeof data.detail === "string" ? data.detail : "诊断失败", true);
+      return;
+    }
+    if (currentSnapshotId !== snapshotId) return;
+    renderDiagnosis(data, false);
+    showToast("诊断完成并已保存");
+  } catch (error) {
+    showToast(`诊断请求失败：${error.message}`, true);
+  } finally {
+    els.diagnoseBtn.disabled = false;
+    els.diagnoseBtn.textContent = "重新诊断";
+  }
+}
+
+function describeGroup(group) {
+  const d = group.detail || {};
+  switch (group.kind) {
+    case "setpoint_range":
+      return `位置：第 ${d.minutes[0]}～${d.minutes[d.minutes.length - 1]} 分钟全部设定值`;
+    case "ramp_limit":
+      return `位置：相邻分钟对 ${d.pairs.map((p) => `${p[0]}–${p[1]}`).join("、")}，跃变上限 ${d.max_change}℃`;
+    case "lock":
+      return `位置：第 ${d.minute} 分钟，锁定值 ${d.value}℃`;
+    case "zone_upper":
+      return `关联轨迹：${d.zone_name}（α=${d.coefficients.join("、")}）；位置：第 ${d.minutes[0]}～${d.minutes[d.minutes.length - 1]} 分钟全程（含初温）`;
+    case "zone_final":
+      return `关联轨迹：${d.zone_name}（α=${d.coefficients.join("、")}）；位置：第 ${d.minute} 分钟末，区间 [${d.low}, ${d.high}]℃`;
+    case "zone_exposure":
+      return `关联轨迹：${d.zone_name}（α=${d.coefficients.join("、")}）；位置：第 ${d.minutes[0]}～${d.minutes[d.minutes.length - 1]} 分钟累计，阈值 ${d.threshold}℃`;
+    default:
+      return "";
+  }
+}
+
+function renderDiagnosis(data, cached) {
+  els.diagnosisHint.hidden = true;
+  const coreSet = new Set(data.core);
+  const coreGroups = data.groups.filter((group) => coreSet.has(group.id));
+  const savedAt = data.created_at ? ` · 保存于 ${data.created_at.replace("T", " ").replace("+00:00", " UTC")}` : "";
+  els.diagnosisBody.innerHTML = `
+    <p class="diagnosis-meta">诊断 #${data.diagnosis_id} · ${cached ? "已保存结果" : "本次运行"} · 耗时 ${data.elapsed_ms} ms / 预算 ${data.timeout_ms} ms · 共 ${data.checks} 次求解${savedAt}</p>
+    <p class="result-message">${escapeHtml(data.message)}</p>
+    <h4>极小冲突组（${coreGroups.length} 组，删去任一组即有解）</h4>
+    <ol class="core-list">
+      ${coreGroups.map((group) => `
+        <li>
+          <strong>${escapeHtml(group.name)}</strong>
+          <span class="muted">${escapeHtml(describeGroup(group))}</span>
+        </li>`).join("")}
+    </ol>
+    <h4>逐组删除的可行性见证（从最终冲突子集删除）</h4>
+    ${data.witnesses.map((witness) => `
+      <div class="witness-card">
+        <div class="witness-title">删除「${escapeHtml(witness.group_name)}」→ 有可行曲线</div>
+        <div class="witness-curve">${witness.setpoints.map((value, index) => `<span class="chip">U${index + 1}=${value}</span>`).join("")}</div>
+        <div class="muted">设定值总和 ${witness.objective_total}（仅满足删除该组后的约束，供定位参考）</div>
+      </div>`).join("")}
+    <h4>全部可开关约束组（${data.groups.length} 组）</h4>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>约束组</th><th>关联轨迹 / 位置</th><th>约束数</th><th>在冲突组中</th></tr></thead>
+        <tbody>
+          ${data.groups.map((group) => `
+            <tr class="${coreSet.has(group.id) ? "core-row" : ""}">
+              <td>${escapeHtml(group.name)}</td>
+              <td>${escapeHtml(describeGroup(group))}</td>
+              <td>${group.constraint_count}</td>
+              <td>${coreSet.has(group.id) ? "是" : "否"}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+  els.diagnoseBtn.textContent = "重新诊断";
 }
 
 async function loadSnapshots() {
